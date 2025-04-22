@@ -1,6 +1,7 @@
+%% -*- mode: erlang; erlang-indent-level: 4; indent-tabs-mode: nil -*-
 %% -------------------------------------------------------------------
 %%
-%% Copyright (c) 2013 Basho Technologies, Inc.  All Rights Reserved.
+%% Copyright (c) 2013-2016 Basho Technologies, Inc.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -52,7 +53,10 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
--include_lib("riak_ensemble_types.hrl").
+-include_lib("kernel/include/logger.hrl").
+
+-include("riak_ensemble_types.hrl").
+
 -define(ETS, ?MODULE).
 
 -type vsn_views()     :: {vsn(), views()}.
@@ -562,7 +566,7 @@ save_state(#state{cluster_state=CS}) ->
         ok
     catch
         _:Err ->
-            error_logger:error_msg("Failed saving riak_ensemble_manager state~n"),
+            ?LOG_ERROR("Failed saving ~s state: ~0tp", [?MODULE, Err]),
             {error, Err}
     end.
 

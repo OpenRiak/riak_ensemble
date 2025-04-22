@@ -1,6 +1,8 @@
+%% -*- mode: erlang; erlang-indent-level: 4; indent-tabs-mode: nil -*-
 %% -------------------------------------------------------------------
 %%
-%% Copyright (c) 2013 Basho Technologies, Inc.  All Rights Reserved.
+%% Copyright (c) 2014 Basho Technologies, Inc.
+%% Copyright (c) 2025 Workday, Inc.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -20,7 +22,7 @@
 -module(riak_ensemble_peer_tree).
 -behaviour(gen_server).
 
--compile({nowarn_deprecated_function, 
+-compile({nowarn_deprecated_function,
             [{gen_fsm, send_event, 2}]}).
 
 %% API
@@ -42,8 +44,7 @@
          async_repair/1]).
 
 %% gen_server callbacks
--export([init/1, handle_call/3, handle_cast/2, handle_info/2,
-         terminate/2, code_change/3]).
+-export([init/1, handle_call/3, handle_cast/2]).
 
 -record(state, {tree :: any(),
                 corrupted :: {integer(), integer()} | undefined
@@ -137,10 +138,13 @@ async_repair(Pid) ->
 %%%===================================================================
 
 init([Id, TreeId, Path]) ->
-    Tree = synctree:newdb(Id, [{path, Path},
-                               {tree_id, TreeId}]),
-    State = #state{tree=Tree},
-    {ok, State}.
+    Opts = #{path => Path, tree_id => TreeId},
+    case synctree:newdb(Id, Opts) of
+        {ok, Tree} ->
+            {ok, #state{tree = Tree}};
+        Error ->
+            Error
+    end.
 
 handle_call({get, Key}, _From, State) ->
     {Reply, State2} = do_get(Key, State),
@@ -197,15 +201,6 @@ handle_cast({async_repair, From}, State) ->
     {noreply, State2};
 handle_cast(_Msg, State) ->
     {noreply, State}.
-
-handle_info(_Info, State) ->
-    {noreply, State}.
-
-terminate(_Reason, _State) ->
-    ok.
-
-code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
 
 %%%===================================================================
 %%% Internal functions

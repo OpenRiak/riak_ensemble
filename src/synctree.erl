@@ -1,6 +1,8 @@
+%% -*- mode: erlang; erlang-indent-level: 4; indent-tabs-mode: nil -*-
 %% -------------------------------------------------------------------
 %%
-%% Copyright (c) 2014 Basho Technologies, Inc.  All Rights Reserved.
+%% Copyright (c) 2014 Basho Technologies, Inc.
+%% Copyright (c) 2025 Workday, Inc.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -82,42 +84,55 @@
 -export([rehash_upper/1, rehash/1]).
 -export([verify_upper/1, verify/1]).
 
-%% TODO: Should we eeally exporting these directly?
+%% TODO: Should we really be exporting these directly?
 -export([m_batch/2, m_flush/1]).
 
+-export_type([
+    action/0, actions/0,
+    bucket/0,
+    key/0,
+    level/0,
+    m_state/0,
+    options/0,
+    value/0
+]).
+
+-callback new(Opts :: options()) -> {ok, m_state()} | {error, term()}.
+-callback delete(Key :: key(), State :: m_state()) -> m_state().
+-callback exists(Key :: key(), State :: m_state()) -> boolean().
+-callback fetch(Key :: key(), Default :: value(), State :: m_state()) -> value().
+-callback store(Updates :: actions(), State :: m_state()) -> m_state().
+-callback store(Key :: key(), Val :: value(), State :: m_state()) -> m_state().
+
 -include_lib("kernel/include/logger.hrl").
+
+-include("synctree.hrl").
 
 -define(WIDTH, 16).
 -define(SEGMENTS, 1024*1024).
 
--type action() :: {put, _, _} |
-                  {delete, _}.
-
--type hash()   :: binary().
--type key()    :: term().
--type value()  :: binary().
--type level()  :: non_neg_integer().
--type bucket() :: non_neg_integer().
--type hashes() :: [{_, hash()}].
+-type hash()    :: binary().
+-type hashes()  :: list({_, hash()}).
+-type m_state() :: any().
+-type options() :: #{atom() => term()} | list({atom(), term()}).
 
 -type corrupted() :: {corrupted, level(), bucket()}.
-
--record(tree, {id        :: term(),
-               width     :: pos_integer(),
-               segments  :: pos_integer(),
-               height    :: pos_integer(),
-               shift     :: pos_integer(),
-               shift_max :: pos_integer(),
-               top_hash  :: hash() | undefined,
-               buffer    :: [action()],
-               buffered  :: non_neg_integer(),
-               mod       :: module(),
-               modstate  :: any()
-              }).
-
--type tree() :: #tree{}.
 -type maybe_integer() :: pos_integer() | default.
--type options() :: proplists:proplist().
+
+-record(tree, {
+    id        :: term(),
+    width     :: pos_integer(),
+    segments  :: pos_integer(),
+    height    :: pos_integer(),
+    shift     :: pos_integer(),
+    shift_max :: pos_integer(),
+    top_hash  :: hash() | undefined,
+    buffer    :: [action()],
+    buffered  :: non_neg_integer(),
+    mod       :: module(),
+    modstate  :: m_state()
+}).
+-type tree() :: #tree{}.
 
 %% Supported hash methods
 -define(H_MD5, 0).
@@ -126,55 +141,66 @@
 %% API
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
--spec newdb(term()) -> tree().
+-spec newdb(term()) -> {ok, tree()} | {error, term()}.
 newdb(Id) ->
-    newdb(Id, []).
+    newdb(Id, #{}).
 
--spec newdb(term(), options()) -> tree().
+-spec newdb(term(), options()) -> {ok, tree()} | {error, term()}.
 newdb(Id, Opts) ->
-    new(Id, default, default, synctree_leveldb, Opts).
+    new(Id, default, default, synctree_leveled, Opts).
 
--spec new() -> tree().
+-spec new() -> {ok, tree()} | {error, term()}.
 new() ->
     new(undefined).
 
--spec new(term()) -> tree().
+-spec new(term()) -> {ok, tree()} | {error, term()}.
 new(Id) ->
     new(Id, ?WIDTH, ?SEGMENTS).
 
--spec new(term(), maybe_integer(), maybe_integer()) -> tree().
+-spec new(term(), maybe_integer(), maybe_integer())
+        -> {ok, tree()} | {error, term()}.
 new(Id, Width, Segments) ->
     new(Id, Width, Segments, synctree_ets).
 
--spec new(term(), maybe_integer(), maybe_integer(), module()) -> tree().
+-spec new(term(), maybe_integer(), maybe_integer(), module())
+        -> {ok, tree()} | {error, term()}.
 new(Id, Width, Segments, Mod) ->
-    new(Id, Width, Segments, Mod, []).
+    new(Id, Width, Segments, Mod, #{}).
 
--spec new(term(), maybe_integer(), maybe_integer(), module(), options()) -> tree().
+-spec new(term(), maybe_integer(), maybe_integer(), module(), options())
+        -> {ok, tree()} | {error, term()}.
 new(Id, default, Segments, Mod, Opts) ->
     new(Id, ?WIDTH, Segments, Mod, Opts);
 new(Id, Width, default, Mod, Opts) ->
     new(Id, Width, ?SEGMENTS, Mod, Opts);
-new(Id, Width, Segments, Mod, Opts) ->
+new(Id, Width, Segments, Mod, Opts) when erlang:is_map(Opts) ->
     Height = compute_height(Segments, Width),
     Shift = compute_shift(Width),
     ShiftMax = Shift * Height,
-    Tree = #tree{id=Id,
-                 width=Width,
-                 segments=Segments,
-                 height=Height,
-                 shift=Shift,
-                 shift_max=ShiftMax,
-                 buffer=[],
-                 buffered=0,
-                 mod=Mod,
-                 modstate=Mod:new(Opts)},
-    reload_top_hash(Tree).
+    case Mod:new(Opts) of
+        {ok, ModState} ->
+            Tree = #tree{
+                id = Id,
+                width = Width,
+                segments = Segments,
+                height = Height,
+                shift = Shift,
+                shift_max = ShiftMax,
+                buffer = [],
+                buffered = 0,
+                mod = Mod,
+                modstate = ModState},
+            {ok, reload_top_hash(Tree)};
+        Error ->
+            Error
+    end;
+new(Id, Width, Segments, Mod, Opts) when erlang:is_list(Opts) ->
+    new(Id, Width, Segments, Mod, proplists:to_map(Opts)).
 
 -spec reload_top_hash(tree()) -> tree().
 reload_top_hash(Tree) ->
-    {ok, TopHash} = m_fetch({0,0}, undefined, Tree),
-    Tree#tree{top_hash=TopHash}.
+    TopHash = m_fetch({0, 0}, undefined, Tree),
+    Tree#tree{top_hash = TopHash}.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
@@ -244,7 +270,7 @@ exchange_get(Level, Bucket, Tree) ->
 corrupt(Key, Tree=#tree{height=Height}) ->
     Segment = get_segment(Key, Tree),
     Bucket = {Height + 1, Segment},
-    {ok, Hashes} = m_fetch(Bucket, [], Tree),
+    Hashes = m_fetch(Bucket, [], Tree),
     Hashes2 = orddict:erase(Key, Hashes),
     m_store(Bucket, Hashes2, Tree).
 
@@ -308,7 +334,7 @@ get_path(Segment, Tree=#tree{shift=Shift, shift_max=N}) ->
 get_path(N, Level, Shift, Segment, UpHashes, Tree, Acc) ->
     Bucket = Segment bsr N,
     Expected = orddict_find(Bucket, undefined, UpHashes),
-    {ok, Hashes} = m_fetch({Level, Bucket}, [], Tree),
+    Hashes = m_fetch({Level, Bucket}, [], Tree),
     Acc2 = [{{Level, Bucket}, Hashes}|Acc],
     Verify = verify_hash(Expected, Hashes),
     case {Verify, N} of
@@ -356,7 +382,7 @@ orddict_find(Key, Default, L) ->
 direct_exchange(Tree=#tree{}) ->
     fun(exchange_get, {Level, Bucket}) ->
             exchange_get(Level, Bucket, Tree);
-       (start_exchange_level, {_Level, _Buckets}) -> 
+       (start_exchange_level, {_Level, _Buckets}) ->
            ok
     end.
 
@@ -512,7 +538,7 @@ rehash(MaxDepth, Tree) ->
 
 rehash(Level, MaxDepth, Bucket, Tree) when Level =:= MaxDepth ->
     %% final level, just return the stored value
-    {ok, Hashes} = m_fetch({Level, Bucket}, [], Tree),
+    Hashes = m_fetch({Level, Bucket}, [], Tree),
     {Tree, Hashes};
 rehash(Level, MaxDepth, Bucket, Tree=#tree{width=Width}) ->
     X0 = Bucket * Width,
@@ -560,7 +586,7 @@ verify(MaxDepth, Tree) ->
     verify(1, MaxDepth, 0, top_hash(Tree), Tree).
 
 verify(Level, MaxDepth, Bucket, UpHash, Tree) ->
-    {ok, Hashes} = m_fetch({Level, Bucket}, [], Tree),
+    Hashes = m_fetch({Level, Bucket}, [], Tree),
     case verify_hash(UpHash, Hashes) of
         false ->
             false;

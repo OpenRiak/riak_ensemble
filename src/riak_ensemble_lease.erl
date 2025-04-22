@@ -1,6 +1,8 @@
+%% -*- mode: erlang; erlang-indent-level: 4; indent-tabs-mode: nil -*-
 %% -------------------------------------------------------------------
 %%
-%% Copyright (c) 2014 Basho Technologies, Inc.  All Rights Reserved.
+%% Copyright (c) 2014 Basho Technologies, Inc.
+%% Copyright (c) 2025 Workday, Inc.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -79,12 +81,7 @@ check_lease({_, T}) ->
         undefined ->
             false;
         Until ->
-            case riak_ensemble_clock:monotonic_time_ms() of
-                {ok, Time} when Time < Until ->
-                    true;
-                _ ->
-                    false
-            end
+            erlang:monotonic_time(millisecond) < Until
     end.
 
 -spec lease(lease_ref(), timeout()) -> ok.
@@ -109,12 +106,8 @@ init(Parent, Ref) ->
 loop(T, Timeout) ->
     receive
         {{lease, Duration}, From} ->
-            case riak_ensemble_clock:monotonic_time_ms() of
-                {ok, Time} ->
-                    ets:insert(T, {lease, Time + Duration});
-                error ->
-                    ets:insert(T, {lease, undefined})
-            end,
+            Time = erlang:monotonic_time(millisecond),
+            ets:insert(T, {lease, Time + Duration}),
             reply(From, ok),
             ?MODULE:loop(T, Duration);
         {unlease, From} ->

@@ -1,6 +1,8 @@
+%% -*- mode: erlang; erlang-indent-level: 4; indent-tabs-mode: nil -*-
 %% -------------------------------------------------------------------
 %%
-%% Copyright (c) 2014 Basho Technologies, Inc.  All Rights Reserved.
+%% Copyright (c) 2014 Basho Technologies, Inc.
+%% Copyright (c) 2025 Workday, Inc.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -18,49 +20,92 @@
 %%
 %% -------------------------------------------------------------------
 -module(synctree_ets).
+-behavior(synctree).
 
--export([new/1,
-         fetch/3,
-         exists/2,
-         store/3,
-         store/2]).
+%% synctree behavior
+-export([
+    new/1,
+    delete/2,
+    exists/2,
+    fetch/3,
+    store/2, store/3
+]).
 
--record(?MODULE, {ets :: ets:tid()}).
--define(STATE, #?MODULE).
--type state() :: ?STATE{}.
+-compile([
+    no_auto_import,
+    warn_missing_spec_all
+]).
 
--spec new(_) -> state().
+-type state() :: ets:tid().
+
+-include("synctree.hrl").
+
+%% ===================================================================
+%% synctree callbacks
+%% ===================================================================
+
+-spec new(synctree:options()) -> {ok, state()}.
 new(_) ->
-    T = ets:new(?MODULE, []),
-    ?STATE{ets=T}.
+    TID = case ets:new(?MODULE, []) of
+        ?MODULE ->
+            ets:whereis(?MODULE);
+        Tid ->
+            Tid
+    end,
+    {ok, TID}.
 
--spec fetch(_, _, state()) -> {ok, _}.
-fetch(Key, Default, ?STATE{ets=T}) ->
-    case ets:lookup(T, Key) of
+-spec delete(Key :: key(), State :: state()) -> state().
+delete(Key, TID) ->
+    ets:delete(TID, Key),
+    TID.
+
+-spec exists(Key :: key(), State :: state()) -> boolean().
+exists(Key, TID) ->
+    ets:member(TID, Key).
+
+-spec fetch(Key :: key(), Default :: value(), State :: state()) -> value().
+fetch(Key, Default, TID) ->
+    case ets:lookup(TID, Key) of
         [] ->
-            {ok, Default};
+            Default;
         [{_, Value}] ->
-            {ok, Value}
+            Value
     end.
 
--spec exists(_, state()) -> boolean().
-exists(Key, ?STATE{ets=T}) ->
-    ets:member(T, Key).
+-spec store(Updates :: actions(), State :: state()) -> state().
+store(Updates, TID) ->
+    Inserts = store_inserts(Updates),
+    ets:insert(TID, Inserts),
+    Deletes = store_deletes(Updates, Inserts),
+    _ = [ets:delete_object(TID, Rec) || Rec <- Deletes],
+    TID.
 
--spec store(_, _, state()) -> state().
-store(Key, Val, State=?STATE{ets=T}) ->
-    _ = ets:insert(T, {Key, Val}),
-    State.
+-spec store(Key :: key(), Val :: value(), state()) -> state().
+store(Key, Val, TID) ->
+    ets:insert(TID, {Key, Val}),
+    TID.
 
--spec store([{_,_}], state()) -> state().
-store(Updates, State=?STATE{ets=T}) ->
-    %% _ = ets:insert(T, Updates),
-    Inserts = [case Update of
-                   {put, Key, Val} ->
-                       {Key, Val};
-                   {delete, Key} ->
-                       {Key, deleted}
-               end || Update <- Updates],
-    _ = ets:insert(T, Inserts),
-    _ = [ets:delete_object(T, {Key, deleted}) || {delete, Key} <- Updates],
-    State.
+%% ===================================================================
+%% Internal
+%% ===================================================================
+
+-type ets_delete()  :: {key(), deleted}.
+-type ets_deletes() :: list(ets_delete()).
+-type ets_insert()  :: {key(), value()}.
+-type ets_inserts() :: list(ets_insert()).
+
+-spec store_deletes(actions(), ets_inserts()) -> ets_deletes().
+store_deletes([{delete, _} | Updates], [Rec | Inserts]) ->
+    [Rec | store_deletes(Updates, Inserts)];
+store_deletes([_ | Updates], [_ | Inserts]) ->
+    store_deletes(Updates, Inserts);
+store_deletes([], []) ->
+    [].
+
+-spec store_inserts(actions()) -> ets_inserts().
+store_inserts([{put, Key, Val} | Updates]) ->
+    [{Key, Val} | store_inserts(Updates)];
+store_inserts([{delete, Key} | Updates]) ->
+    [{Key, deleted} | store_inserts(Updates)];
+store_inserts([]) ->
+    [].

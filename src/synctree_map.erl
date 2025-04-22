@@ -1,6 +1,8 @@
+%% -*- mode: erlang; erlang-indent-level: 4; indent-tabs-mode: nil -*-
 %% -------------------------------------------------------------------
 %%
-%% Copyright (c) 2014 Basho Technologies, Inc.  All Rights Reserved.
+%% Copyright (c) 2014 Basho Technologies, Inc.
+%% Copyright (c) 2025 Workday, Inc.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -17,50 +19,78 @@
 %% under the License.
 %%
 %% -------------------------------------------------------------------
--module(synctree_orddict).
+-module(synctree_map).
+-behavior(synctree).
 
--export([new/1,
-         fetch/3,
-         exists/2,
-         store/3,
-         store/2]).
+%% synctree behavior
+-export([
+    new/1,
+    delete/2,
+    exists/2,
+    fetch/3,
+    store/2, store/3
+]).
 
--record(?MODULE, {data :: [{_,_}]}).
--define(STATE, #?MODULE).
--type state() :: ?STATE{}.
+-compile([
+    no_auto_import,
+    warn_missing_spec_all
+]).
 
--spec new(_) -> state().
+-type kvmap() :: #{key() => value()}.
+-type state() :: kvmap().
+
+-include("synctree.hrl").
+
+%% ===================================================================
+%% synctree callbacks
+%% ===================================================================
+
+-spec new(synctree:options()) -> {ok, state()}.
 new(_) ->
-    L = orddict:new(),
-    ?STATE{data=L}.
+    {ok, #{}}.
 
--spec fetch(_, _, state()) -> {ok,_}.
-fetch(Key, Default, ?STATE{data=L}) ->
-    case orddict:find(Key, L) of
-        error ->
-            {ok, Default};
-        {ok, Value} ->
-            {ok, Value}
-    end.
+-spec delete(Key :: key(), State :: state()) -> state().
+delete(Key, Map) ->
+    maps:remove(Key, Map).
 
--spec exists(_, state()) -> boolean().
-exists(Key, ?STATE{data=L}) ->
-    lists:keymember(Key, 1, L).
+-spec exists(Key :: key(), State :: state()) -> boolean().
+exists(Key, Map) ->
+    erlang:is_map_key(Key, Map).
 
--spec store(_, _, state()) -> state().
-store(Key, Val, State=?STATE{data=L}) ->
-    L2 = orddict:store(Key, Val, L),
-    State?STATE{data=L2}.
+-spec fetch(Key :: key(), Default :: value(), State :: state()) -> value().
+fetch(Key, Default, Map) ->
+    maps:get(Key, Map, Default).
 
--spec store([{_,_}], state()) -> state().
-store(Updates, State=?STATE{data=L}) ->
-    Inserts = [case Update of
-                   {put, Key, Val} ->
-                       {Key, Val};
-                   {delete, Key} ->
-                       {Key, deleted}
-               end || Update <- Updates],
-    L2 = lists:ukeymerge(1, lists:sort(Inserts), L),
-    L3 = [X || X={_, Val} <- L2,
-               Val =/= deleted],
-    State?STATE{data=L3}.
+-spec store(Updates :: actions(), State :: state()) -> state().
+store(Updates, Map) ->
+    {Inserts, Deletes} = aggregate_stores(Updates, #{}),
+    maps:merge(maps:without(Deletes, Map), Inserts).
+
+-spec store(Key :: key(), Val :: value(), state()) -> state().
+store(Key, Val, Map) ->
+    Map#{Key => Val}.
+
+%% ===================================================================
+%% Internal
+%% ===================================================================
+
+-type inserts() :: kvmap().
+-type deletes() :: list(key()).
+
+-spec aggregate_stores(actions(), kvmap())
+        -> {inserts(), deletes()}.
+aggregate_stores([{put, Key, Val} | Updates], Stores) ->
+    aggregate_stores(Updates, Stores#{Key => Val});
+aggregate_stores([{delete, Key} | Updates], Stores) ->
+    aggregate_stores(Updates, Stores#{Key => deleted});
+aggregate_stores([], Stores) ->
+    maps:fold(fun fold_stores/3, {#{}, []}, Stores);
+aggregate_stores(Updates, _Stores) ->
+    erlang:error(badarg, [Updates]).
+
+-spec fold_stores(key(), value(), {inserts(), deletes()})
+        -> {inserts(), deletes()}.
+fold_stores(Key, deleted, {Inserts, Deletes}) ->
+    {Inserts, [Key | Deletes]};
+fold_stores(Key, Val, {Inserts, Deletes}) ->
+    {Inserts#{Key => Val}, Deletes}.

@@ -1,6 +1,7 @@
+%% -*- mode: erlang; erlang-indent-level: 4; indent-tabs-mode: nil -*-
 %% -------------------------------------------------------------------
 %%
-%% Copyright (c) 2013 Basho Technologies, Inc.  All Rights Reserved.
+%% Copyright (c) 2013-2014 Basho Technologies, Inc.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -18,7 +19,6 @@
 %%
 %% -------------------------------------------------------------------
 -module(riak_ensemble_sup).
-
 -behaviour(supervisor).
 
 %% API
@@ -47,7 +47,6 @@ start_link() ->
 
 init([]) ->
     riak_ensemble_test:setup(),
-    synctree_leveldb:init_ets(),
     Children = [?CHILD(riak_ensemble_router_sup, supervisor),
                 ?CHILD(riak_ensemble_storage, worker),
                 ?CHILD(riak_ensemble_peer_sup, supervisor),

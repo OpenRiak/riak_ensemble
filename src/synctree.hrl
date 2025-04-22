@@ -1,7 +1,6 @@
 %% -*- mode: erlang; erlang-indent-level: 4; indent-tabs-mode: nil -*-
 %% -------------------------------------------------------------------
 %%
-%% Copyright (c) 2014 Basho Technologies, Inc.
 %% Copyright (c) 2025 Workday, Inc.
 %%
 %% This file is provided to you under the Apache License,
@@ -19,30 +18,22 @@
 %% under the License.
 %%
 %% -------------------------------------------------------------------
-%% Various pure tests
--module(ensemble_tests_pure).
+-ifndef(synctree_types_included).
+-define(synctree_types_included, true).
 
-%% EUnit test entry.
--export([run_test_/0]).
+-type action()  :: {put, key(), value()} | {delete, key()}.
+-type actions() :: list(action()).
+-type bucket()  :: non_neg_integer().
+-type key()     :: {level(), bucket()}.
+-type level()   :: byte().
+-type value()   :: any().
 
-%% Internal invoked by name.
--export([
-    test_monotonic_time/0
-]).
+-define(ST_LEVEL_BITS, 8).
 
--include_lib("stdlib/include/assert.hrl").
+-define(is_non_neg_integer(I),  (erlang:is_integer(I) andalso I >= 0)).
+-define(is_pos_integer(I),      (erlang:is_integer(I) andalso I > 0)).
+-define(is_st_bucket(B),        ?is_non_neg_integer(B)).
+-define(is_st_level(L),
+    (erlang:is_integer(L) andalso L >= 0 andalso L =< 255)).
 
--define(TEST(X), {timeout, 60, {test, ?MODULE, X}}).
-
-run_test_() ->
-    [?TEST(test_monotonic_time)].
-
-test_monotonic_time() ->
-    N1 = erlang:monotonic_time(nanosecond),
-    M1 = erlang:monotonic_time(millisecond),
-    timer:sleep(1000),
-    N2 = erlang:monotonic_time(nanosecond),
-    M2 = erlang:monotonic_time(millisecond),
-    ?assert((N2 - N1) >= 1000000000),
-    ?assert((M2 - M1) >= 1000),
-    ok.
+-endif. % synctree_types_included

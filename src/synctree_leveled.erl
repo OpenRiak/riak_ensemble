@@ -1,6 +1,8 @@
+%% -*- mode: erlang; erlang-indent-level: 4; indent-tabs-mode: nil -*-
 %% -------------------------------------------------------------------
 %%
-%% Copyright (c) 2014 Basho Technologies, Inc.  All Rights Reserved.
+%% Copyright (c) 2014 Basho Technologies, Inc.
+%% Copyright (c) 2025 Workday, Inc.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -17,146 +19,253 @@
 %% under the License.
 %%
 %% -------------------------------------------------------------------
--module(synctree_leveldb).
+-module(synctree_leveled).
+-behavior(synctree).
 
--export([init_ets/0,
-         new/1,
-         fetch/3,
-         exists/2,
-         store/3,
-         store/2]).
+%% synctree behavior
+-export([
+    new/1,
+    delete/2,
+    exists/2,
+    fetch/3,
+    store/2, store/3
+]).
 
--record(?MODULE, {id   :: binary(),
-                  db   :: any(),
-                  path :: term()}).
+-compile([
+    no_auto_import,
+    warn_missing_spec_all
+]).
 
--define(STATE, #?MODULE).
--type state() :: ?STATE{}.
+-type db()      :: pid().                   %% from leveled_bookie::start()
+-type db_opts() :: proplists:proplist().    %% leveled_bookie:open_options()
+-type id()      :: binary().
+-type options() :: #{atom() => term()}.
+-type path()    :: nonempty_string().       %% filesystem path
+-type backoff() :: pos_integer().           %% milliseconds
+-type state()   :: #{
+    id      := id(),
+    db      := db(),
+    path    := path(),
+    backoff := backoff()    %% pause if the leveled_bookie asks for backoff
+}.
 
--define(RETRIES, 10).
+-include_lib("kernel/include/logger.hrl").
+
+-include("synctree.hrl").
+
+-define(OPEN_RETRIES,   10).
+-define(RETRY_DELAY_MS, 100).
+
+%% The time in ms to pause if the leveled_bookie asks for backoff.
+-define(BACKOFF_PAUSE,  1).
 
 %% -------------------------------------------------------------------
-
-%% Prefix bytes used to tag keys stored in LevelDB to allow for easy
+%% Prefix version used to tag keys stored in LevelEd to allow for easy
 %% evolution of the storage format.
-
-%% Key representing {Bucket, Level} data
--define(K_BUCKET, 0).
-
+-define(KEY_VERSION,    0).
+-define(KEY_VSN_BITS,   8).
 %% -------------------------------------------------------------------
 
-%% @doc
-%% Called by {@link riak_ensemble_sup} to create the public ETS table used
-%% to keep track of shared LevelDB references. Having riak_ensemble_sup
-%% own the ETS table ensures it survives as long as riak_ensemble is up.
--spec init_ets() -> ok.
-init_ets() ->
-    _ = ets:new(?MODULE, [named_table, set, public,
-                          {read_concurrency, true},
-                          {write_concurrency, true}]),
-    ok.
+%% ===================================================================
+%% synctree callbacks
+%% ===================================================================
 
--spec new(_) -> state().
-new(Opts) ->
-    Path = get_path(Opts),
-    {ok, DB} = maybe_open_leveldb(Path, ?RETRIES),
-    Id = get_tree_id(Opts),
-    ?STATE{id=Id, path=Path, db=DB}.
+-spec new(synctree:options()) -> {ok, state()} | {error, term()}.
+new(Opts) when erlang:is_map(Opts) ->
+    Path = getopt_path(Opts),
+    case maybe_open_leveled(Path, Opts) of
+        {ok, DB} ->
+            {ok, #{
+                backoff => getopt_backoff(Opts),
+                db      => DB,
+                id      => getopt_tree_id(Opts),
+                path    => Path
+            }};
+        Error ->
+            Error
+    end;
+new(Opts) when erlang:is_list(Opts) ->
+    new(proplists:to_map(Opts)).
 
-maybe_open_leveldb(Path, Retries) ->
-    %% Check if we have already opened this LevelDB instance, which can
-    %% occur when peers are sharing the same on-disk instance.
-    case ets:lookup(?MODULE, Path) of
-        [{_, DB}] ->
-            {ok, DB};
-        _ ->
-	    ok = filelib:ensure_dir(Path),
-	    case eleveldb:open(Path, leveldb_opts()) of
-		{ok, DB} ->
-		    %% If eleveldb:open succeeded, we should have the only ref
-		    true = ets:insert_new(?MODULE, {Path, DB}),
-		    {ok, DB};
-		_ when Retries > 0 ->
-		    timer:sleep(100),
-		    maybe_open_leveldb(Path, Retries - 1)
-	    end
-    end.
+-spec delete(Key :: key(), State :: state()) -> state().
+delete(Key, #{id := Id, db := DB, backoff := BO} = State) ->
+    {B, K} = db_bucket_key(Id, Key),
+    leveled_bookie:book_delete(DB, B, K, []) =/= pause orelse timer:sleep(BO),
+    State.
 
-
-get_path(Opts) ->
-    case proplists:get_value(path, Opts) of
-        undefined ->
-            Base = "/tmp/ST",
-            Name = integer_to_list(timestamp(os:timestamp())),
-            filename:join(Base, Name);
-        Path ->
-            Path
-    end.
-
-get_tree_id(Opts) ->
-    case proplists:get_value(tree_id, Opts) of
-        undefined ->
-            <<>>;
-        Id when is_binary(Id) ->
-            Id
-    end.
-
-db_key(Id, {Level, Bucket}) ->
-    db_key(Id, Level, Bucket).
-
-db_key(Id, Level, Bucket)  when is_integer(Level), is_integer(Bucket) ->
-    BucketBin = binary:encode_unsigned(Bucket),
-    <<?K_BUCKET:8/integer, Id/binary,  Level:8/integer, BucketBin/binary>>.
-
--spec fetch(_, _, state()) -> {ok, _}.
-fetch({Level, Bucket}, Default, ?STATE{id=Id, db=DB}) ->
-    DBKey = db_key(Id, Level, Bucket),
-    case eleveldb:get(DB, DBKey, []) of
-        {ok, Bin} ->
-            try
-                {ok, binary_to_term(Bin)}
-            catch
-                _:_ -> {ok, Default}
-            end;
-        _ ->
-            {ok, Default}
-    end.
-
-exists({Level, Bucket}, ?STATE{id=Id, db=DB}) ->
-    DBKey = db_key(Id, Level, Bucket),
-    case eleveldb:get(DB, DBKey, []) of
+-spec exists(Key :: key(), State :: state()) -> boolean().
+exists(Key, #{id := Id, db := DB}) ->
+    {B, K} = db_bucket_key(Id, Key),
+    case leveled_bookie:book_get(DB, B, K) of
         {ok, _} ->
             true;
         _ ->
             false
     end.
 
--spec store(_, _, state()) -> state().
-store({Level, Bucket}, Val, State=?STATE{id=Id, db=DB}) ->
-    DBKey = db_key(Id, Level, Bucket),
-    %% Intentionally ignore errors (TODO: Should we?)
-    _ = eleveldb:put(DB, DBKey, term_to_binary(Val), []),
+-spec fetch(Key :: key(), Default :: value(), State :: state()) -> value().
+fetch(Key, Default, #{id := Id, db := DB}) ->
+    {B, K} = db_bucket_key(Id, Key),
+    case leveled_bookie:book_get(DB, B, K) of
+        {ok, Val} ->
+            Val;
+        _ ->
+            Default
+    end.
+
+-spec store(Updates :: actions(), State :: state()) -> state().
+store([{put, Key, Val} | Updates], State) ->
+    store(Updates, store(Key, Val, State));
+store([{delete, Key} | Updates], State) ->
+    store(Updates, delete(Key, State));
+store([], State) ->
+    State;
+store(Updates, _State) ->
+    erlang:error(badarg, [Updates]).
+
+-spec store(Key :: key(), Val :: value(), state()) -> state().
+store(Key, Val, #{id := Id, db := DB, backoff := BO} = State) ->
+    {B, K} = db_bucket_key(Id, Key),
+    leveled_bookie:book_put(DB, B, K, Val, []) =/= pause orelse timer:sleep(BO),
     State.
 
--spec store([{_,_}], state()) -> state().
-store(Updates, State=?STATE{id=Id, db=DB}) ->
-    %% TODO: Should we sort first? Doesn't LevelDB do that automatically in memtable?
-    DBUpdates = [case Update of
-                     {put, Key, Val} ->
-                         {put, db_key(Id, Key), term_to_binary(Val)};
-                     {delete, Key} ->
-                         {delete, db_key(Id, Key)}
-                 end || Update <- Updates],
-    %% Intentionally ignore errors (TODO: Should we?)
-    _ = eleveldb:write(DB, DBUpdates, []),
-    State.
+%% ===================================================================
+%% Internal
+%% ===================================================================
 
-timestamp({Mega, Secs, Micro}) ->
-    Mega*1000*1000*1000*1000 + Secs * 1000 * 1000 + Micro.
+-spec db_bucket_key(Id :: id(), Key :: key()) -> {binary(), binary()}.
+db_bucket_key(Id, {Level, Bucket}) when erlang:is_binary(Id)
+        andalso ?is_st_level(Level) andalso ?is_st_bucket(Bucket) ->
+    BBin = binary:encode_unsigned(Bucket),
+    KBin = <<?KEY_VERSION:?KEY_VSN_BITS/integer,
+        Id/binary, Level:?ST_LEVEL_BITS/integer>>,
+    {BBin, KBin};
+db_bucket_key(Id, Key) ->
+    erlang:error(badarg, [Id, Key]).
 
-leveldb_opts() ->
-    [{is_internal_db, true},
-     {write_buffer_size, 4 * 1024 * 1024},
-     {use_bloomfilter, true},
-     {create_if_missing, true}].
+-spec get_ets() -> ets:tid().
+%% Creates the public ETS table used to keep track of shared LevelEd
+%% references.
+%% If the ensemble supervisor is running, ownership of the table is assigned
+%% to it, otherwise it's owned by the calling process, almost certainly a test.
+get_ets() ->
+    case ets:whereis(?MODULE) of
+        undefined ->
+            Opts = [
+                named_table, set, public,
+                {read_concurrency, true},
+                {write_concurrency, true}
+            ],
+            New = case ets:new(?MODULE, Opts) of
+                ?MODULE ->
+                    ets:whereis(?MODULE);
+                Tid ->
+                    Tid
+            end,
+            _ = case erlang:whereis(riak_ensemble_sup) of
+                Pid when erlang:is_pid(Pid) ->
+                    ets:give_away(New, Pid, ?MODULE);
+                Nope ->
+                    Nope
+            end,
+            New;
+        TID ->
+            TID
+    end.
 
+-spec maybe_open_leveled(Path :: path(), Opts :: options())
+        -> {ok, db()} | {error, term()}.
+maybe_open_leveled(Path, Opts) ->
+    maybe_open_leveled(Path, Opts, get_ets(), getopt_retries(Opts)).
+
+-spec maybe_open_leveled(
+    Path :: path(), Opts :: options(),
+    Ets :: ets:tid(), Retries :: non_neg_integer())
+        -> {ok, db()} | {error, term()}.
+maybe_open_leveled(Path, Opts, Ets, Retries) ->
+    %% Check if we have already opened this LevelEd instance, which can
+    %% occur when peers are sharing the same on-disk instance.
+    Ets = get_ets(),
+    case ets:lookup(Ets, Path) of
+        [{_Path, {running, DB}}] ->
+            {ok, DB};
+        [{_Path, starting}] when Retries > 0 ->
+            %% Another process is starting, retry
+            timer:sleep(?RETRY_DELAY_MS),
+            maybe_open_leveled(Path, Opts, Ets, (Retries - 1));
+        [{_Path, starting}] ->
+            %% We're out of retries
+            {error, timeout};
+        [] ->
+            case ets:insert_new(Ets, {Path, starting}) of
+                true ->
+                    ok = filelib:ensure_dir(Path),
+                    DbOpts = getopt_leveled_opts(Path, Opts),
+                    {ok, DB} = Res = leveled_bookie:book_start(DbOpts),
+                    ets:insert(?MODULE, {Path, {running, DB}}),
+                    Res;
+                _ ->
+                    %% Race with another process, re-enter immediately
+                    %% to pick up current state
+                    maybe_open_leveled(Path, Opts, Ets, Retries)
+            end;
+        Values ->
+            %% Nothing else *should* be possible ...
+            Record = {Path, Values},
+            ?LOG_ERROR("Unrecognized ETS record: ~0tp", [Record]),
+            {error, {unrecognized, Record}}
+    end.
+
+%% ===================================================================
+%% Options Handling
+%% ===================================================================
+
+-define(NON_DB_OPTS, [backoff_ms, open_retries, path, tree_id]).
+
+-spec getopt_backoff(Opts :: options()) -> backoff().
+getopt_backoff(#{backoff_ms := Backoff}) when ?is_pos_integer(Backoff) ->
+    Backoff;
+getopt_backoff(#{backoff_ms := Backoff}) ->
+    erlang:error(badarg, [backoff_ms, Backoff]);
+getopt_backoff(_Opts) ->
+    ?BACKOFF_PAUSE.
+
+-spec getopt_leveled_opts(Path :: path(), Opts :: options()) -> db_opts().
+getopt_leveled_opts(Path, #{leveled := DbOpts}) ->
+    lists:keystore(root_path, 1, DbOpts, {root_path, Path});
+getopt_leveled_opts(Path, Opts) ->
+    proplists:from_map(
+        maps:put(root_path, Path, maps:without(?NON_DB_OPTS, Opts))).
+
+-spec getopt_path(options()) -> path().
+getopt_path(#{path := Path}) ->
+    safe_path(Path);
+getopt_path(_Opts) ->
+    Base = "/tmp/ST",
+    Name = erlang:integer_to_list(os:system_time(microsecond)),
+    safe_path(filename:join(Base, Name)).
+
+-spec safe_path(Path :: unicode:chardata()) -> path().
+safe_path(Path) ->
+    case unicode:characters_to_list(Path) of
+        [_|_] = FlatList ->
+            FlatList;
+        Error ->
+            erlang:error(badarg, [Path, Error])
+    end.
+
+-spec getopt_retries(Opts :: options()) -> backoff().
+getopt_retries(#{open_retries := Retries}) when ?is_non_neg_integer(Retries) ->
+    Retries;
+getopt_retries(#{open_retries := Retries}) ->
+    erlang:error(badarg, [open_retries, Retries]);
+getopt_retries(_Opts) ->
+    ?OPEN_RETRIES.
+
+-spec getopt_tree_id(options()) -> id().
+getopt_tree_id(#{tree_id := Id}) when erlang:is_binary(Id) ->
+    Id;
+getopt_tree_id(#{tree_id := Id}) ->
+    erlang:error(badarg, [tree_id, Id]);
+getopt_tree_id(_Opts) ->
+    <<>>.

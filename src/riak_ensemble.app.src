@@ -1,13 +1,11 @@
-{application, riak_ensemble,
- [
-  {description, "Multi-Paxos framework in Erlang"},
-  {vsn, git},
-  {registered, []},
-  {applications, [
-                  kernel,
-                  stdlib,
-                  eleveldb
-                 ]},
-  {mod, { riak_ensemble_app, []}},
-  {env, []}
- ]}.
+%% -*- mode: erlang; erlang-indent-level: 4; indent-tabs-mode: nil -*-
+{application, riak_ensemble, [
+    {description, "Multi-Paxos framework in Erlang"},
+    {vsn, "3.0.10.1"},
+    {registered, []},
+    {applications, [
+        kernel, stdlib, leveled
+    ]},
+    {mod, {riak_ensemble_app, []}},
+    {env, []}
+]}.
