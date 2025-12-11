@@ -1,4 +1,4 @@
-![Ensemble OpenRiak Status](https://github.com/OpenRiak/riak_ensemble/actions/workflows/erlang.yml/badge.svg?branch=openriak-3.2)
+![Ensemble OpenRiak Status](https://github.com/OpenRiak/riak_ensemble/actions/workflows/erlang.yml/badge.svg?branch=openriak-3.4)
 
 (Note: Work-in-progress documentation [here](https://github.com/basho/riak_ensemble/blob/develop/doc/Readme.md))
 
